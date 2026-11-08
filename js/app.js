@@ -1,9 +1,9 @@
-import * as db from './db.js';
-import { processImage, blobToDataURL, dataURLToBlob } from './image.js';
+import * as db from './db.js?v=2';
+import { readFiles, processImage, photoBlob, bufferToDataURL, dataURLToBuffer } from './image.js?v=2';
 import {
   icons, esc, el, COLORS, colorHex, textOn,
   openSheet, confirmSheet, menuSheet, toast, formatDate, formatDateTime,
-} from './ui.js';
+} from './ui.js?v=2';
 
 const $header = document.getElementById('topbar');
 const $main = document.getElementById('main');
@@ -118,6 +118,11 @@ async function renderHome(token) {
       <h1>我的書房</h1>
       <p class="hero__stats">${shelves.length} 個書架 · ${books.length} 本書</p>
     </section>
+    ${showIOSTip() ? `
+      <aside class="tip">
+        <p><strong>小提醒</strong>資料只存在這台手機的 Safari 裡，若超過 7 天沒開啟，系統可能會清除。建議點「分享 → 加入主畫面」使用，並定期從右上角選單匯出備份。</p>
+        <button class="icon-btn" data-tip-close aria-label="關閉提醒">${icons.close}</button>
+      </aside>` : ''}
     ${shelves.length ? `
       <label class="search">
         <span class="icon">${icons.search}</span>
@@ -126,6 +131,10 @@ async function renderHome(token) {
     <div class="home-content"></div>`;
 
   const $content = $main.querySelector('.home-content');
+  $main.querySelector('[data-tip-close]')?.addEventListener('click', (e) => {
+    try { localStorage.setItem('ios-tip-dismissed', '1'); } catch {}
+    e.currentTarget.closest('.tip').remove();
+  });
 
   const renderShelves = () => {
     if (!shelves.length) {
@@ -162,6 +171,14 @@ async function renderHome(token) {
     q ? renderSearch(q) : renderShelves();
   });
   return {};
+}
+
+function showIOSTip() {
+  const ios = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone = navigator.standalone || matchMedia('(display-mode: standalone)').matches;
+  let dismissed = false;
+  try { dismissed = localStorage.getItem('ios-tip-dismissed') === '1'; } catch {}
+  return ios && !standalone && !dismissed;
 }
 
 function snippet(text, kw) {
@@ -290,7 +307,7 @@ async function renderShelf(shelfId, token) {
       return `
         <a class="book-card" href="#/book/${encodeURIComponent(b.id)}">
           <div class="book-card__cover" style="--c:${bg};--fg:${textOn(bg)}">
-            ${cover ? `<img src="${objectURL(cover.thumb || cover.blob)}" alt="" loading="lazy">` : `<span class="book-card__ph">${esc(bookTitle(b))}</span>`}
+            ${photoBlob(cover, 'thumb') ? `<img src="${objectURL(photoBlob(cover, 'thumb'))}" alt="" loading="lazy">` : `<span class="book-card__ph">${esc(bookTitle(b))}</span>`}
           </div>
           <div class="book-card__title">${esc(bookTitle(b))}</div>
           <div class="book-card__meta">${b.author ? esc(b.author) + ' · ' : ''}${formatDate(b.updatedAt)}${b.photoIds.length ? ` · ${b.photoIds.length} 張照片` : ''}</div>
@@ -431,11 +448,14 @@ async function renderBook(bookId, token) {
   /* 照片 */
   const renderPhotos = (pending = 0) => {
     revokeAll();
-    $photos.innerHTML = photos.map((p, i) => `
-      <button type="button" class="photo" data-i="${i}" aria-label="查看第 ${i + 1} 張照片">
-        <img src="${objectURL(p.thumb || p.blob)}" alt="">
-        ${i === 0 ? '<span class="photo__badge">封面</span>' : ''}
-      </button>`).join('') + '<div class="photo is-loading"><span></span></div>'.repeat(pending);
+    $photos.innerHTML = photos.map((p, i) => {
+      const blob = photoBlob(p, 'thumb');
+      return `
+      <button type="button" class="photo ${blob ? '' : 'is-broken'}" data-i="${i}" aria-label="查看第 ${i + 1} 張照片">
+        ${blob ? `<img src="${objectURL(blob)}" alt="">` : '<span class="photo__broken">無法讀取<br>請重新上傳</span>'}
+        ${i === 0 && blob ? '<span class="photo__badge">封面</span>' : ''}
+      </button>`;
+    }).join('') + '<div class="photo is-loading"><span></span></div>'.repeat(pending);
     $photos.hidden = !photos.length && !pending;
     $main.querySelector('[data-photo-count]').textContent = photos.length ? `${photos.length} 張` : '';
     $photos.querySelectorAll('[data-i]').forEach((b) =>
@@ -444,18 +464,23 @@ async function renderBook(bookId, token) {
 
   $main.querySelectorAll('[data-file]').forEach((input) => input.addEventListener('change', async () => {
     const files = [...input.files];
-    input.value = '';
     if (!files.length) return;
     let remaining = files.length;
     renderPhotos(remaining);
+    // iOS 的 File 指向暫存檔，下次選檔就會被刪除：先把所有位元組複製到記憶體再處理
+    const sources = await readFiles(files);
+    input.value = '';
+    requestPersistentStorage();
     let failed = 0;
-    for (const file of files) {
+    for (const src of sources) {
       try {
-        const { blob, thumb } = await processImage(file);
-        const photo = { id: db.uid(), bookId: book.id, blob, thumb, createdAt: Date.now() };
+        if (!src) throw new Error('讀不到檔案內容');
+        const img = await processImage(src);
+        const photo = { id: db.uid(), bookId: book.id, ...img, createdAt: Date.now() };
         book.photoIds.push(photo.id);
         book.updatedAt = Date.now();
-        await db.putMany([['photos', photo], ['books', book]]);
+        // 照片與書的照片清單在同一個交易中寫入
+        await db.commit({ puts: [['photos', photo], ['books', book]] });
         photos.push(photo);
       } catch (err) {
         console.error(err);
@@ -478,7 +503,7 @@ async function renderBook(bookId, token) {
         photos.unshift(p);
         book.photoIds = photos.map((x) => x.id);
         book.updatedAt = Date.now();
-        await db.put('books', book);
+        await db.commit({ puts: [['books', book]] });
         renderPhotos();
         toast('已設為封面');
         return 0;
@@ -487,8 +512,7 @@ async function renderBook(bookId, token) {
         const [p] = photos.splice(i, 1);
         book.photoIds = photos.map((x) => x.id);
         book.updatedAt = Date.now();
-        await db.putMany([['books', book]]);
-        await db.deletePhoto(p.id);
+        await db.commit({ puts: [['books', book]], dels: [['photos', p.id]] });
         renderPhotos();
         updateDates();
         toast('已刪除照片');
@@ -552,7 +576,7 @@ function autosize(ta) {
 function photoViewer({ photos, start, onSetCover, onDelete }) {
   return new Promise((resolve) => {
     let index = start;
-    const urls = [];
+    let url = null;
     const root = el(`
       <div class="viewer" role="dialog" aria-modal="true" aria-label="照片檢視">
         <div class="viewer__bar">
@@ -563,6 +587,7 @@ function photoViewer({ photos, start, onSetCover, onDelete }) {
         <div class="viewer__stage">
           <button class="viewer__nav is-prev" data-prev aria-label="上一張">${icons.left}</button>
           <img alt="">
+          <p class="viewer__broken" hidden>這張照片無法讀取，請刪除後重新上傳。</p>
           <button class="viewer__nav is-next" data-next aria-label="下一張">${icons.right}</button>
         </div>
         <div class="viewer__tools">
@@ -574,17 +599,22 @@ function photoViewer({ photos, start, onSetCover, onDelete }) {
     document.body.classList.add('has-sheet');
     requestAnimationFrame(() => root.classList.add('is-open'));
     const $img = root.querySelector('img');
+    const $broken = root.querySelector('.viewer__broken');
 
     const show = () => {
       if (!photos.length) return close();
       index = Math.max(0, Math.min(index, photos.length - 1));
-      const url = URL.createObjectURL(photos[index].blob);
-      urls.push(url);
-      $img.src = url;
+      if (url) URL.revokeObjectURL(url);
+      const blob = photoBlob(photos[index]);
+      url = blob ? URL.createObjectURL(blob) : null;
+      $img.hidden = !url;
+      $broken.hidden = !!url;
+      if (url) $img.src = url;
+      else $img.removeAttribute('src');
       root.querySelector('.viewer__count').textContent = `${index + 1} / ${photos.length}`;
       root.querySelector('[data-prev]').hidden = index === 0;
       root.querySelector('[data-next]').hidden = index === photos.length - 1;
-      root.querySelector('[data-cover]').disabled = index === 0;
+      root.querySelector('[data-cover]').disabled = index === 0 || !url;
     };
     const step = (d) => { const n = index + d; if (n >= 0 && n < photos.length) { index = n; show(); } };
     const onKey = (e) => {
@@ -598,7 +628,7 @@ function photoViewer({ photos, start, onSetCover, onDelete }) {
       root.classList.remove('is-open');
       setTimeout(() => {
         root.remove();
-        urls.forEach((u) => URL.revokeObjectURL(u));
+        if (url) URL.revokeObjectURL(url);
         if (!document.querySelector('.sheet-backdrop')) document.body.classList.remove('has-sheet');
       }, 200);
       resolve();
@@ -639,27 +669,53 @@ async function exportBackup() {
     toast('正在準備備份…');
     const [shelves, books, photos] = await Promise.all([db.getAll('shelves'), db.getAll('books'), db.getAll('photos')]);
     const outPhotos = [];
+    let skipped = 0;
     for (const p of photos) {
+      if (p.broken || !p.data) { skipped++; continue; }
       outPhotos.push({
         id: p.id, bookId: p.bookId, createdAt: p.createdAt,
-        data: await blobToDataURL(p.blob),
-        thumb: p.thumb ? await blobToDataURL(p.thumb) : null,
+        data: await bufferToDataURL(p.data, p.type),
+        thumb: p.thumb ? await bufferToDataURL(p.thumb, p.type) : null,
       });
     }
-    const payload = { app: 'reading-library', version: 1, exportedAt: Date.now(), shelves, books, photos: outPhotos };
-    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const payload = { app: 'reading-library', version: 2, exportedAt: Date.now(), shelves, books, photos: outPhotos };
     const d = new Date();
-    const name = `閱讀心得備份-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.json`;
-    const a = el(`<a download="${esc(name)}"></a>`);
-    a.href = URL.createObjectURL(blob);
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
-    toast(`已匯出 ${shelves.length} 個書架、${books.length} 本書`);
+    const name = `reading-library-backup-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}.json`;
+    const file = new File([JSON.stringify(payload)], name, { type: 'application/json' });
+    const mb = (file.size / 1048576).toFixed(1);
+
+    // 準備備份要花一點時間，iOS 需要使用者再點一次才允許分享 / 下載
+    await openSheet({
+      title: '備份已準備好',
+      html: `<p class="sheet__text">${shelves.length} 個書架、${books.length} 本書、${outPhotos.length} 張照片（約 ${mb} MB）。${skipped ? `<br>有 ${skipped} 張無法讀取的照片未包含在內。` : ''}<br>iPhone 可選「儲存到檔案」。</p>`,
+      actions: [
+        { label: '取消', getValue: () => null },
+        { label: '儲存備份檔', kind: 'wood', getValue: () => { saveFile(file); return true; } },
+      ],
+    });
   } catch (err) {
     console.error(err);
     toast('匯出失敗：' + err.message);
   }
+}
+
+async function saveFile(file) {
+  // iOS Safari：用分享面板（可「儲存到檔案」），不在新分頁開 blob: 網址
+  if (navigator.canShare?.({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: file.name });
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      console.warn('分享失敗，改用下載', err);
+    }
+  }
+  const a = el(`<a download="${esc(file.name)}"></a>`);
+  a.href = URL.createObjectURL(file);
+  document.body.appendChild(a);
+  a.click();
+  // 太早釋放網址，Safari 會出現 WebKitBlobResource 錯誤，所以保留久一點
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 60000);
 }
 
 function importBackup() {
@@ -685,11 +741,12 @@ function importBackup() {
       for (const s of data.shelves) entries.push(['shelves', s]);
       for (const b of data.books) entries.push(['books', { ...b, photoIds: b.photoIds || [] }]);
       for (const p of data.photos || []) {
-        const blob = await dataURLToBlob(p.data);
-        const thumb = p.thumb ? await dataURLToBlob(p.thumb) : blob;
-        entries.push(['photos', { id: p.id, bookId: p.bookId, createdAt: p.createdAt, blob, thumb }]);
+        if (!p.data) continue;
+        const full = dataURLToBuffer(p.data);
+        const thumb = p.thumb ? dataURLToBuffer(p.thumb).data : full.data;
+        entries.push(['photos', { id: p.id, bookId: p.bookId, createdAt: p.createdAt, data: full.data, thumb, type: full.type }]);
       }
-      await db.putMany(entries);
+      await db.commit({ puts: entries });
       toast('匯入完成');
       router();
     } catch (err) {
@@ -702,11 +759,28 @@ function importBackup() {
 
 /* ---------- 啟動 ---------- */
 
-window.addEventListener('hashchange', router);
-router();
+// 請求瀏覽器保留資料，降低被系統自動清除的機會（第一次上傳照片時也會再請求一次）
+let persistAsked = false;
+function requestPersistentStorage() {
+  if (persistAsked) return;
+  persistAsked = true;
+  navigator.storage?.persist?.().catch(() => {});
+}
 
-// 請求瀏覽器保留資料，不要在空間不足時自動清除
-navigator.storage?.persist?.().catch(() => {});
+async function start() {
+  try {
+    // 舊版本把照片存成 Blob，在 iOS 上可能失效：轉成 ArrayBuffer，讀不到的標記為損壞
+    const { broken } = await db.migratePhotos();
+    if (broken) toast(`有 ${broken} 張舊照片無法讀取，請重新上傳`);
+  } catch (err) {
+    console.error('資料轉換失敗', err);
+  }
+  window.addEventListener('hashchange', router);
+  router();
+  requestPersistentStorage();
+}
+
+start();
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
